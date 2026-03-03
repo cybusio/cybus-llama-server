@@ -283,6 +283,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - name: Parse version
         id: ver
         run: echo "v=${LLAMA_VERSION#llama-}" >> "$GITHUB_OUTPUT"
