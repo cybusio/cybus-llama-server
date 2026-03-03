@@ -1,1 +1,1 @@
-llama-server-binaries
+Release repo for cybus llm's llama server binaries
