@@ -32,6 +32,13 @@ jobs:
           path: bin/llama-server/linux_amd64/llama-server
           key: llama-server-${{ steps.ver.outputs.v }}-linux-amd64
 
+      - name: Cache llama-server linux/amd64 (Vulkan)
+        id: cache-vulkan
+        uses: actions/cache@v4
+        with:
+          path: bin/llama-server/linux_amd64_vulkan/llama-server
+          key: llama-server-${{ steps.ver.outputs.v }}-linux-amd64-vulkan
+
       - name: Cache llama-server linux/arm64
         id: cache-arm64
         uses: actions/cache@v4
@@ -40,7 +47,7 @@ jobs:
           key: llama-server-${{ steps.ver.outputs.v }}-linux-arm64
 
       - name: Clone llama.cpp
-        if: steps.cache-amd64.outputs.cache-hit != 'true' || steps.cache-arm64.outputs.cache-hit != 'true'
+        if: steps.cache-amd64.outputs.cache-hit != 'true' || steps.cache-vulkan.outputs.cache-hit != 'true' || steps.cache-arm64.outputs.cache-hit != 'true'
         run: git clone --depth 1 --branch "${{ steps.ver.outputs.v }}" https://github.com/ggml-org/llama.cpp.git llama.cpp
 
       - name: Build linux/amd64
@@ -58,6 +65,32 @@ jobs:
                      -DGGML_STATIC=ON \
                      -DGGML_NATIVE=OFF \
                      -DGGML_OPENMP=ON \
+                     -DGGML_LLAMAFILE=ON \
+                     -DGGML_LTO=ON \
+                     -DLLAMA_BUILD_TESTS=OFF \
+                     -DLLAMA_BUILD_EXAMPLES=OFF \
+                     -DLLAMA_BUILD_SERVER=ON && \
+                   cmake --build /build --config Release -j\$(nproc) --target llama-server && \
+                   strip /build/bin/llama-server && \
+                   cp /build/bin/llama-server /out/ && \
+                   chown $(id -u):$(id -g) /out/llama-server"
+
+      - name: Build linux/amd64 (Vulkan)
+        if: steps.cache-vulkan.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p bin/llama-server/linux_amd64_vulkan
+          docker run --rm \
+            -v "$PWD/llama.cpp:/src:ro" \
+            -v "$PWD/bin/llama-server/linux_amd64_vulkan:/out" \
+            debian:bookworm \
+            sh -c "apt-get update -qq && apt-get install -y -qq cmake g++ make glslc libvulkan-dev >/dev/null 2>&1 && \
+                   cmake -S /src -B /build \
+                     -DCMAKE_BUILD_TYPE=Release \
+                     -DBUILD_SHARED_LIBS=OFF \
+                     -DGGML_STATIC=ON \
+                     -DGGML_NATIVE=OFF \
+                     -DGGML_OPENMP=ON \
+                     -DGGML_VULKAN=ON \
                      -DGGML_LLAMAFILE=ON \
                      -DGGML_LTO=ON \
                      -DLLAMA_BUILD_TESTS=OFF \
@@ -108,6 +141,7 @@ jobs:
         run: |
           mkdir -p dist
           tar -czf "dist/llama-server_linux_amd64.tar.gz" -C bin/llama-server/linux_amd64 llama-server
+          tar -czf "dist/llama-server_linux_amd64_vulkan.tar.gz" -C bin/llama-server/linux_amd64_vulkan llama-server
           tar -czf "dist/llama-server_linux_arm64.tar.gz" -C bin/llama-server/linux_arm64 llama-server
           cd dist && sha256sum *.tar.gz > checksums_linux.txt
 
