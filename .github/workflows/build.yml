@@ -82,12 +82,11 @@ jobs:
           docker run --rm \
             -v "$PWD/llama.cpp:/src:ro" \
             -v "$PWD/bin/llama-server/linux_amd64_vulkan:/out" \
-            debian:bookworm \
+            ubuntu:24.04 \
             sh -c "apt-get update -qq && apt-get install -y -qq cmake g++ make glslc libvulkan-dev >/dev/null 2>&1 && \
                    cmake -S /src -B /build \
                      -DCMAKE_BUILD_TYPE=Release \
                      -DBUILD_SHARED_LIBS=OFF \
-                     -DGGML_STATIC=ON \
                      -DGGML_NATIVE=OFF \
                      -DGGML_OPENMP=ON \
                      -DGGML_VULKAN=ON \
