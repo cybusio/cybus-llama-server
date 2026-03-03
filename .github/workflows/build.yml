@@ -1,0 +1,339 @@
+name: Build llama-server
+
+# Trigger: push a tag matching llama-b<N> (e.g. llama-b8192).
+# The tag encodes the llama.cpp build number.
+# Workflow: linux + macos + windows (parallel) → release (collects artifacts).
+on:
+  push:
+    tags: ['llama-b*']
+
+concurrency:
+  group: llama-server-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Extract version from tag name: llama-b8192 → b8192
+  LLAMA_VERSION: ${{ github.ref_name }}
+
+jobs:
+  # ─── Linux: build amd64 and arm64 via cross-compile ───────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Parse version
+        id: ver
+        run: echo "v=${LLAMA_VERSION#llama-}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache llama-server linux/amd64
+        id: cache-amd64
+        uses: actions/cache@v4
+        with:
+          path: bin/llama-server/linux_amd64/llama-server
+          key: llama-server-${{ steps.ver.outputs.v }}-linux-amd64
+
+      - name: Cache llama-server linux/arm64
+        id: cache-arm64
+        uses: actions/cache@v4
+        with:
+          path: bin/llama-server/linux_arm64/llama-server
+          key: llama-server-${{ steps.ver.outputs.v }}-linux-arm64
+
+      - name: Clone llama.cpp
+        if: steps.cache-amd64.outputs.cache-hit != 'true' || steps.cache-arm64.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch "${{ steps.ver.outputs.v }}" https://github.com/ggml-org/llama.cpp.git llama.cpp
+
+      - name: Build linux/amd64
+        if: steps.cache-amd64.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p bin/llama-server/linux_amd64
+          docker run --rm \
+            -v "$PWD/llama.cpp:/src:ro" \
+            -v "$PWD/bin/llama-server/linux_amd64:/out" \
+            debian:bookworm \
+            sh -c "apt-get update -qq && apt-get install -y -qq cmake g++ make >/dev/null 2>&1 && \
+                   cmake -S /src -B /build \
+                     -DCMAKE_BUILD_TYPE=Release \
+                     -DBUILD_SHARED_LIBS=OFF \
+                     -DGGML_STATIC=ON \
+                     -DGGML_NATIVE=OFF \
+                     -DGGML_OPENMP=ON \
+                     -DGGML_LLAMAFILE=ON \
+                     -DGGML_LTO=ON \
+                     -DLLAMA_BUILD_TESTS=OFF \
+                     -DLLAMA_BUILD_EXAMPLES=OFF \
+                     -DLLAMA_BUILD_SERVER=ON && \
+                   cmake --build /build --config Release -j\$(nproc) --target llama-server && \
+                   strip /build/bin/llama-server && \
+                   cp /build/bin/llama-server /out/ && \
+                   chown $(id -u):$(id -g) /out/llama-server"
+
+      - name: Build linux/arm64
+        if: steps.cache-arm64.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p bin/llama-server/linux_arm64
+          docker run --rm \
+            -v "$PWD/llama.cpp:/src:ro" \
+            -v "$PWD/bin/llama-server/linux_arm64:/out" \
+            debian:bookworm \
+            sh -c "apt-get update -qq && apt-get install -y -qq cmake g++ make g++-aarch64-linux-gnu binutils-aarch64-linux-gnu >/dev/null 2>&1 && \
+                   cmake -S /src -B /build \
+                     -DCMAKE_BUILD_TYPE=Release \
+                     -DBUILD_SHARED_LIBS=OFF \
+                     -DGGML_STATIC=ON \
+                     -DGGML_NATIVE=OFF \
+                     -DGGML_OPENMP=ON \
+                     -DGGML_LLAMAFILE=OFF \
+                     -DGGML_LTO=ON \
+                     -DGGML_CPU_ARM_ARCH=armv8-a \
+                     -DLLAMA_BUILD_TESTS=OFF \
+                     -DLLAMA_BUILD_EXAMPLES=OFF \
+                     -DLLAMA_BUILD_SERVER=ON \
+                     -DCMAKE_SYSTEM_NAME=Linux \
+                     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+                     -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+                     -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ && \
+                   cmake --build /build --config Release -j\$(nproc) --target llama-server && \
+                   aarch64-linux-gnu-strip /build/bin/llama-server && \
+                   cp /build/bin/llama-server /out/ && \
+                   chown $(id -u):$(id -g) /out/llama-server"
+
+      - name: Smoke test amd64
+        run: bin/llama-server/linux_amd64/llama-server --version
+
+      - name: Smoke test arm64 (verify binary format)
+        run: file bin/llama-server/linux_arm64/llama-server | tee /dev/stderr | grep -q "aarch64"
+
+      - name: Create archives
+        run: |
+          mkdir -p dist
+          tar -czf "dist/llama-server_linux_amd64.tar.gz" -C bin/llama-server/linux_amd64 llama-server
+          tar -czf "dist/llama-server_linux_arm64.tar.gz" -C bin/llama-server/linux_arm64 llama-server
+          cd dist && sha256sum *.tar.gz > checksums_linux.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-linux
+          path: dist/
+          retention-days: 1
+
+  # ─── macOS: native arm64 on M1, cross-compile amd64 from M1 ──────────────
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: amd64
+            runner: macos-14    # cross-compile x86_64 from M1 (macos-13 deprecated)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Parse version
+        id: ver
+        run: echo "v=${LLAMA_VERSION#llama-}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache llama-server darwin/${{ matrix.arch }}
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: bin/llama-server/darwin_${{ matrix.arch }}/llama-server
+          key: llama-server-${{ steps.ver.outputs.v }}-darwin-${{ matrix.arch }}
+
+      - name: Install build tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: brew install cmake
+
+      - name: Clone llama.cpp
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch "${{ steps.ver.outputs.v }}" https://github.com/ggml-org/llama.cpp.git llama.cpp
+
+      - name: Build darwin/${{ matrix.arch }}
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          OUTDIR="bin/llama-server/darwin_${{ matrix.arch }}"
+          mkdir -p "$OUTDIR"
+
+          LLAMAFILE=OFF
+          EXTRA_FLAGS=()
+          ARCH="${{ matrix.arch }}"
+          if [[ "$ARCH" == "amd64" ]]; then
+            LLAMAFILE=ON
+            ARCH="x86_64"
+            EXTRA_FLAGS+=(-DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE)
+          fi
+
+          cmake -S llama.cpp -B build-llama \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_STATIC=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_ACCELERATE=ON \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_LLAMAFILE=$LLAMAFILE \
+            -DGGML_LTO=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_ARCHITECTURES=$ARCH \
+            "${EXTRA_FLAGS[@]}"
+
+          cmake --build build-llama --config Release -j"$(sysctl -n hw.logicalcpu)" --target llama-server
+          strip build-llama/bin/llama-server
+          cp build-llama/bin/llama-server "$OUTDIR/"
+
+      - name: Smoke test
+        if: matrix.arch == 'arm64'  # amd64 cross-compiled from M1 can't run under Rosetta (Metal GPU)
+        run: bin/llama-server/darwin_${{ matrix.arch }}/llama-server --version
+
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          tar -czf "dist/llama-server_darwin_${{ matrix.arch }}.tar.gz" \
+            -C bin/llama-server/darwin_${{ matrix.arch }} llama-server
+          cd dist && shasum -a 256 "llama-server_darwin_${{ matrix.arch }}.tar.gz" \
+            > "checksums_darwin_${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-darwin-${{ matrix.arch }}
+          path: dist/
+          retention-days: 1
+
+  # ─── Windows: amd64 via MinGW cross-compile from Linux ─────────────────────
+  windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Parse version
+        id: ver
+        run: echo "v=${LLAMA_VERSION#llama-}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache llama-server windows/amd64
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: bin/llama-server/windows_amd64/llama-server.exe
+          key: llama-server-${{ steps.ver.outputs.v }}-windows-amd64
+
+      - name: Install MinGW
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+
+      - name: Clone llama.cpp
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch "${{ steps.ver.outputs.v }}" https://github.com/ggml-org/llama.cpp.git llama.cpp
+
+      - name: Build windows/amd64
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          OUTDIR="bin/llama-server/windows_amd64"
+          mkdir -p "$OUTDIR"
+
+          COMPAT_FLAGS="-D_WIN32_WINNT=0x0A00"
+          COMPAT_FLAGS+=" -DTHREAD_POWER_THROTTLING_STATE=PROCESS_POWER_THROTTLING_STATE"
+          COMPAT_FLAGS+=" -DTHREAD_POWER_THROTTLING_CURRENT_VERSION=PROCESS_POWER_THROTTLING_CURRENT_VERSION"
+          COMPAT_FLAGS+=" -DTHREAD_POWER_THROTTLING_EXECUTION_SPEED=PROCESS_POWER_THROTTLING_EXECUTION_SPEED"
+
+          cmake -S llama.cpp -B build-llama \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_STATIC=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_LLAMAFILE=ON \
+            -DGGML_LTO=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DCMAKE_C_FLAGS="${COMPAT_FLAGS}" \
+            -DCMAKE_CXX_FLAGS="${COMPAT_FLAGS}"
+
+          cmake --build build-llama --config Release -j$(nproc) --target llama-server
+          x86_64-w64-mingw32-strip build-llama/bin/llama-server.exe
+          cp build-llama/bin/llama-server.exe "$OUTDIR/"
+
+      - name: Create archive
+        run: |
+          mkdir -p dist
+          cd bin/llama-server/windows_amd64
+          zip "../../../dist/llama-server_windows_amd64.zip" llama-server.exe
+          cd ../../../dist
+          sha256sum llama-server_windows_amd64.zip > checksums_windows.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-windows
+          path: dist/
+          retention-days: 1
+
+  # ─── Release: collect artifacts, merge checksums, publish ─────────────────
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [linux, macos, windows]
+    permissions:
+      contents: write
+    steps:
+      - name: Parse version
+        id: ver
+        run: echo "v=${LLAMA_VERSION#llama-}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: llama-linux
+          path: dist/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: llama-darwin-arm64
+          path: dist/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: llama-darwin-amd64
+          path: dist/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: llama-windows
+          path: dist/
+
+      - name: Merge checksums
+        run: |
+          cd dist
+          cat checksums_linux.txt checksums_darwin_arm64.txt checksums_darwin_amd64.txt checksums_windows.txt \
+            | sort > checksums_sha256.txt
+          rm checksums_linux.txt checksums_darwin_arm64.txt checksums_darwin_amd64.txt checksums_windows.txt
+          echo "==> release assets"
+          ls -lh
+          echo "==> checksums"
+          cat checksums_sha256.txt
+
+      - name: Prune old releases (keep latest 3)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --limit 100 --json tagName --jq '.[].tagName' \
+            | grep '^llama-b' \
+            | sort -t- -k2 -V -r \
+            | tail -n +4 \
+            | xargs -r -I{} gh release delete {} --yes --cleanup-tag || true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ steps.ver.outputs.v }}"
+          gh release create "${{ github.ref_name }}" \
+            --title "llama-server ${V}" \
+            --notes "Pre-built llama-server binaries (llama.cpp ${V}). Metal GPU on macOS, portable CPU on Linux/Windows. Downloaded automatically by cybusAI on first use." \
+            dist/*
